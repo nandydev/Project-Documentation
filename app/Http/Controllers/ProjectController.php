@@ -251,30 +251,87 @@ use Illuminate\Support\Facades\Response;
                 $imageDescriptions = $project->ai_descriptions;
 
                 if (!$imageDescriptions) {
-                    echo json_encode(['error' => 'No image descriptions found']);
+                    echo json_encode(['error' => 'No image descriptions found']) . "\n";
+                    ob_flush();
+                    flush();
                     return;
                 }
 
-                echo json_encode(['status' => 'processing']) . "\n";
+                // Send initial processing status
+                echo json_encode(['status' => 'processing', 'message' => 'Starting AI processing']) . "\n";
                 ob_flush();
                 flush();
 
-                $prompt = "Summarize the following image descriptions into an overall project description:\n" . implode("\n", $imageDescriptions);
-                
-                $response = OpenAI::chat()->create([
-                    'model' => 'gpt-4o',
-                    'messages' => [['role' => 'user', 'content' => $prompt]],
-                ]);
+                // Prepare the system message for better structured output
+                $systemMessage = "You are an AI assistant that generates project descriptions. 
+                    Please analyze the provided image descriptions and generate a comprehensive project description. 
+                    Generate the description in 3-4 chunks, pausing after each chunk.";
 
-                $description = $response['choices'][0]['message']['content'];
-                $project->description = $description;
-                $project->save();
+                $prompt = "Based on these image descriptions, generate a detailed project description:\n" . 
+                         implode("\n", $imageDescriptions);
 
-                echo json_encode([
-                    'status' => 'completed',
-                    'project_id' => $project->id,
-                    'overall_description' => $description
-                ]);
+                try {
+                    $stream = OpenAI::chat()->createStreamed([
+                        'model' => 'gpt-4o',
+                        'messages' => [
+                            ['role' => 'system', 'content' => $systemMessage],
+                            ['role' => 'user', 'content' => $prompt]
+                        ],
+                        'temperature' => 0.7,
+                        'max_tokens' => 1000,
+                    ]);
+
+                    $fullDescription = '';
+                    $chunkBuffer = '';
+
+                    foreach ($stream as $response) {
+                        $content = $response->choices[0]->delta->content;
+                        if ($content !== null) {
+                            $chunkBuffer .= $content;
+                            
+                            // Send chunk when we have a complete sentence or significant content
+                            if (str_ends_with(trim($content), '.') || strlen($chunkBuffer) > 100) {
+                                echo json_encode([
+                                    'status' => 'processing',
+                                    'chunk' => $chunkBuffer,
+                                    'message' => 'Generating description...'
+                                ]) . "\n";
+                                ob_flush();
+                                flush();
+                                
+                                $fullDescription .= $chunkBuffer;
+                                $chunkBuffer = '';
+                            }
+                        }
+                    }
+
+                    // Send any remaining content in the buffer
+                    if (!empty($chunkBuffer)) {
+                        $fullDescription .= $chunkBuffer;
+                    }
+
+                    // Update project with the full description
+                    $project->description = $fullDescription;
+                    $project->save();
+
+                    // Send final response
+                    echo json_encode([
+                        'status' => 'completed',
+                        'project_id' => $project->id,
+                        'overall_description' => $fullDescription,
+                        'message' => 'Description generation completed'
+                    ]) . "\n";
+                    ob_flush();
+                    flush();
+
+                } catch (\Exception $e) {
+                    echo json_encode([
+                        'status' => 'error',
+                        'message' => 'Error generating description: ' . $e->getMessage()
+                    ]) . "\n";
+                    ob_flush();
+                    flush();
+                }
                 
             }, 200, [
                 'Content-Type' => 'application/x-ndjson',
