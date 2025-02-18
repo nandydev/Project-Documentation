@@ -9,6 +9,8 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\Log;
+use Symfony\Component\HttpFoundation\StreamedResponse;
+use Illuminate\Support\Facades\Response;
 
 
     class ProjectController extends Controller
@@ -116,46 +118,83 @@ use Illuminate\Support\Facades\Log;
             ], 200);
         }
 
-        public function generateDescriptions(Project $project): JsonResponse
+        public function generateDescriptions(Project $project): StreamedResponse
         {
             $this->authorize('update', $project);
         
             if (empty($project->images)) {
-                return response()->json(['message' => 'No images found'], 400);
+                return Response::stream(function () {
+                    echo json_encode(['message' => 'No images found']);
+                }, 400, [
+                    'Content-Type' => 'application/json',
+                    'X-Accel-Buffering' => 'no',
+                    'Cache-Control' => 'no-cache',
+                ]);
             }
         
-            $descriptions = [];
-            foreach ($project->images as $image) {
-                try {
-                    // Read and encode the image in base64
-                    $imagePath = Storage::disk('public')->path($image);
-                    $imageContent = base64_encode(file_get_contents($imagePath));
+            return Response::stream(function () use ($project) {
+                $descriptions = [];
+                
+                foreach ($project->images as $index => $image) {
+                    try {
+                        // Read and encode the image in base64
+                        $imagePath = Storage::disk('public')->path($image);
+                        $imageContent = base64_encode(file_get_contents($imagePath));
         
-                    // Make OpenAI API request
-                    $response = OpenAI::chat()->create([
-                        'model' => 'gpt-4o', // Use GPT-4o (multimodal)
-                        'messages' => [
-                            [
-                                'role' => 'user',
-                                'content' => [
-                                    ['type' => 'text', 'text' => 'What is in this image?'],
-                                    ['type' => 'image_url', 'image_url' => ['url' => "data:image/jpeg;base64,{$imageContent}"]],
+                        // Make OpenAI API request
+                        $response = OpenAI::chat()->create([
+                            'model' => 'gpt-4o',
+                            'messages' => [
+                                [
+                                    'role' => 'user',
+                                    'content' => [
+                                        ['type' => 'text', 'text' => 'What is in this image?'],
+                                        ['type' => 'image_url', 'image_url' => ['url' => "data:image/jpeg;base64,{$imageContent}"]],
+                                    ],
                                 ],
                             ],
-                        ],
-                    ]);
+                        ]);
         
-                    // Extract description from response
-                    $descriptions[$image] = $response['choices'][0]['message']['content'] ?? 'No description generated';
-                } catch (\Exception $e) {
-                    $descriptions[$image] = 'Error: ' . $e->getMessage();
+                        $description = $response['choices'][0]['message']['content'] ?? 'No description generated';
+                        $descriptions[$image] = $description;
+                        
+                        // Stream the current progress
+                        echo json_encode([
+                            'progress' => [
+                                'current' => $index + 1,
+                                'total' => count($project->images),
+                                'latest_description' => [
+                                    'image' => $image,
+                                    'description' => $description
+                                ]
+                            ]
+                        ]) . "\n";
+                        
+                        ob_flush();
+                        flush();
+                        
+                    } catch (\Exception $e) {
+                        $descriptions[$image] = 'Error: ' . $e->getMessage();
+                        echo json_encode(['error' => $e->getMessage()]) . "\n";
+                        ob_flush();
+                        flush();
+                    }
                 }
-            }
         
-            // Update project with AI descriptions
-            $project->update(['ai_descriptions' => $descriptions]);
-        
-            return response()->json($project);
+                // Update project with AI descriptions
+                $project->update(['ai_descriptions' => $descriptions]);
+                
+                // Send final response
+                echo json_encode([
+                    'status' => 'completed',
+                    'project' => $project->toArray()
+                ]);
+                
+            }, 200, [
+                'Content-Type' => 'application/x-ndjson',
+                'X-Accel-Buffering' => 'no',
+                'Cache-Control' => 'no-cache',
+            ]);
         }
         
 
@@ -205,62 +244,93 @@ use Illuminate\Support\Facades\Log;
             return response()->json($project);
         }
 
-        public function generateOverallDescription($id)
+        public function generateOverallDescription($id): StreamedResponse
         {
-            $project = Project::findOrFail($id);
-            
-            $imageDescriptions = $project->ai_descriptions;
+            return Response::stream(function () use ($id) {
+                $project = Project::findOrFail($id);
+                $imageDescriptions = $project->ai_descriptions;
 
-            if (!$imageDescriptions) {
-                return response()->json(['error' => 'No image descriptions found'], 404);
-            }
+                if (!$imageDescriptions) {
+                    echo json_encode(['error' => 'No image descriptions found']);
+                    return;
+                }
 
-            $prompt = "Summarize the following image descriptions into an overall project description:\n" . implode("\n", $imageDescriptions);
-            $response = OpenAI::chat()->create([
-                'model' => 'gpt-4o',
-                'messages' => [['role' => 'user', 'content' => $prompt]],
-            ]);
+                echo json_encode(['status' => 'processing']) . "\n";
+                ob_flush();
+                flush();
 
-            $project->description = $response['choices'][0]['message']['content'];
-            $project->save();
+                $prompt = "Summarize the following image descriptions into an overall project description:\n" . implode("\n", $imageDescriptions);
+                
+                $response = OpenAI::chat()->create([
+                    'model' => 'gpt-4o',
+                    'messages' => [['role' => 'user', 'content' => $prompt]],
+                ]);
 
-            return response()->json([
-                'project_id' => $project->id,
-                'overall_description' => $project->description,
+                $description = $response['choices'][0]['message']['content'];
+                $project->description = $description;
+                $project->save();
+
+                echo json_encode([
+                    'status' => 'completed',
+                    'project_id' => $project->id,
+                    'overall_description' => $description
+                ]);
+                
+            }, 200, [
+                'Content-Type' => 'application/x-ndjson',
+                'X-Accel-Buffering' => 'no',
+                'Cache-Control' => 'no-cache',
             ]);
         }
 
 
-        public function generateApiDocumentation(Request $request, $id)
+        public function generateApiDocumentation(Request $request, $id): StreamedResponse
         {
-            $project = Project::findOrFail($id);
-            $imageDescriptions = $request->input('image_descriptions', []);
-            //dd($imageDescriptions);
-            if (empty($imageDescriptions)) {
-                return response()->json(['error' => 'No image descriptions provided'], 422);
-            }
+            return Response::stream(function () use ($request, $id) {
+                $project = Project::findOrFail($id);
+                $imageDescriptions = $request->input('image_descriptions', []);
 
-            $prompt = "Generate comprehensive API documentation for the following endpoints based on these image descriptions:\n" . 
-            implode("\n", $imageDescriptions) . 
-            "\n\nInclude for each endpoint:\n" .
-            "- Endpoint URL\n" .
-            "- HTTP Method\n" .
-            "- Request Parameters with examples\n" .
-            "- Response Format (success and error cases)\n" .
-            "- Possible Status Codes\n" .
-            "- Example Curl request\n";
+                if (empty($imageDescriptions)) {
+                    echo json_encode(['error' => 'No image descriptions provided']);
+                    return;
+                }
 
-            $response = OpenAI::chat()->create([
-                'model' => 'gpt-4o',
-                'messages' => [['role' => 'user', 'content' => $prompt]],
-            ]);
+                echo json_encode(['status' => 'starting']) . "\n";
+                ob_flush();
+                flush();
 
-            $markdown = $response['choices'][0]['message']['content'];
-            \Storage::put("api_docs/project_{$project->id}.md", $markdown);
+                $prompt = "Generate comprehensive API documentation for the following endpoints based on these image descriptions:\n" . 
+                implode("\n", $imageDescriptions) . 
+                "\n\nInclude for each endpoint:\n" .
+                "- Endpoint URL\n" .
+                "- HTTP Method\n" .
+                "- Request Parameters with examples\n" .
+                "- Response Format (success and error cases)\n" .
+                "- Possible Status Codes\n" .
+                "- Example Curl request\n";
 
-            return response()->json([
-                'project_id' => $project->id,
-                'documentation' => $markdown,
+                echo json_encode(['status' => 'generating']) . "\n";
+                ob_flush();
+                flush();
+
+                $response = OpenAI::chat()->create([
+                    'model' => 'gpt-4o',
+                    'messages' => [['role' => 'user', 'content' => $prompt]],
+                ]);
+
+                $markdown = $response['choices'][0]['message']['content'];
+                \Storage::put("api_docs/project_{$project->id}.md", $markdown);
+
+                echo json_encode([
+                    'status' => 'completed',
+                    'project_id' => $project->id,
+                    'documentation' => $markdown,
+                ]);
+                
+            }, 200, [
+                'Content-Type' => 'application/x-ndjson',
+                'X-Accel-Buffering' => 'no',
+                'Cache-Control' => 'no-cache',
             ]);
         }
 
