@@ -408,4 +408,67 @@ use Illuminate\Support\Facades\Response;
         }
         
         
+        public function updateProjectImages(Request $request, Project $project): JsonResponse
+        {
+            $this->authorize('update', $project);
+
+            $request->validate([
+                'images' => 'required|array',
+                'images.*.id' => 'required|exists:images,id',
+                'images.*.description' => 'nullable|string',
+                'images.*.order' => 'required|integer|min:0',
+            ]);
+
+            try {
+                \DB::beginTransaction();
+
+                // Update each image
+                foreach ($request->images as $imageData) {
+                    $image = Image::findOrFail($imageData['id']);
+                    
+                    // Verify the image belongs to this project
+                    if ($image->project_id !== $project->id) {
+                        throw new \Exception('Invalid image ID for this project');
+                    }
+
+                    $image->update([
+                        'description' => $imageData['description'],
+                        'order' => $imageData['order']
+                    ]);
+                }
+
+                // Get all project images ordered by the new order
+                $orderedImages = $project->images()
+                    ->orderBy('order')
+                    ->get();
+
+                // Reindex orders to ensure they are sequential
+                foreach ($orderedImages->values() as $index => $image) {
+                    $image->update(['order' => $index + 1]);
+                }
+
+                // Combine descriptions into project description
+                $combinedDescription = $orderedImages
+                    ->map(fn($image) => $image->description)
+                    ->filter()
+                    ->join("\n\n");
+
+                $project->update(['description' => $combinedDescription]);
+
+                \DB::commit();
+
+                return response()->json([
+                    'message' => 'Images updated successfully',
+                    'project' => $project->load('images')
+                ]);
+
+            } catch (\Exception $e) {
+                \DB::rollBack();
+                return response()->json([
+                    'message' => 'Failed to update images',
+                    'error' => $e->getMessage()
+                ], 500);
+            }
+        }
+        
     }
