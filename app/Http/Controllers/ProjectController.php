@@ -5,6 +5,8 @@ namespace App\Http\Controllers;
 use OpenAI\Laravel\Facades\OpenAI;
 
 use App\Models\Project;
+use App\Models\Image;
+
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Storage;
@@ -46,6 +48,25 @@ use Illuminate\Support\Facades\Response;
 
             return response()->json($project, 201);
         }
+
+        public function getproject($id): JsonResponse
+        {
+            $project = Project::select('id', 'project_name', 'images')
+                ->find($id);
+        
+            if (!$project) {
+                return response()->json([
+                    'message' => 'Project not found',
+                ], 404);
+            }
+        
+            return response()->json([
+                'project_id' => $project->id,
+                'project_name' => $project->project_name,
+                'images' => $project->images ?? [],
+            ]);
+        }
+        
 
         public function show(Project $project): JsonResponse
         {
@@ -121,26 +142,26 @@ use Illuminate\Support\Facades\Response;
         public function generateDescriptions(Project $project): StreamedResponse
         {
             $this->authorize('update', $project);
-        
+
             if (empty($project->images)) {
                 return Response::stream(function () {
-                    echo json_encode(['message' => 'No images found']);
+                    echo json_encode(['message' => 'No images found']) . "\n";
                 }, 400, [
-                    'Content-Type' => 'application/json',
+                    'Content-Type' => 'application/x-ndjson',
                     'X-Accel-Buffering' => 'no',
                     'Cache-Control' => 'no-cache',
                 ]);
             }
-        
+
             return Response::stream(function () use ($project) {
                 $descriptions = [];
-                
+
                 foreach ($project->images as $index => $image) {
                     try {
                         // Read and encode the image in base64
                         $imagePath = Storage::disk('public')->path($image);
                         $imageContent = base64_encode(file_get_contents($imagePath));
-        
+
                         // Make OpenAI API request
                         $response = OpenAI::chat()->create([
                             'model' => 'gpt-4o',
@@ -154,11 +175,11 @@ use Illuminate\Support\Facades\Response;
                                 ],
                             ],
                         ]);
-        
+
                         $description = $response['choices'][0]['message']['content'] ?? 'No description generated';
                         $descriptions[$image] = $description;
-                        
-                        // Stream the current progress
+
+                        // Stream the current progress as chunks
                         echo json_encode([
                             'progress' => [
                                 'current' => $index + 1,
@@ -169,10 +190,8 @@ use Illuminate\Support\Facades\Response;
                                 ]
                             ]
                         ]) . "\n";
-                        
                         ob_flush();
                         flush();
-                        
                     } catch (\Exception $e) {
                         $descriptions[$image] = 'Error: ' . $e->getMessage();
                         echo json_encode(['error' => $e->getMessage()]) . "\n";
@@ -180,96 +199,117 @@ use Illuminate\Support\Facades\Response;
                         flush();
                     }
                 }
-        
+
                 // Update project with AI descriptions
                 $project->update(['ai_descriptions' => $descriptions]);
-                
-                // Send final response
+
+                // Send final response with all descriptions
                 echo json_encode([
                     'status' => 'completed',
                     'project' => $project->toArray()
-                ]);
-                
+                ]) . "\n";
+
             }, 200, [
                 'Content-Type' => 'application/x-ndjson',
                 'X-Accel-Buffering' => 'no',
                 'Cache-Control' => 'no-cache',
             ]);
         }
+
         
 
-        public function editDescriptions(Request $request, Project $project): JsonResponse
+        public function editDescriptions(Request $request, Project $project): StreamedResponse
         {
             $this->authorize('update', $project);
-        
+
             $request->validate([
                 'descriptions' => ['required', 'array'],
                 'descriptions.*' => ['nullable', 'string'],
             ]);
-        
+
             $descriptions = $request->descriptions;
-        
-            foreach ($project->images as $image) {
-                if (empty($descriptions[$image])) {
-                    try {
-                        // Read and encode the image in base64
-                        $imagePath = Storage::disk('public')->path($image);
-                        $imageContent = base64_encode(file_get_contents($imagePath));
-        
-                        // Make OpenAI API request
-                        $response = OpenAI::chat()->create([
-                            'model' => 'gpt-4o',
-                            'messages' => [
-                                [
-                                    'role' => 'user',
-                                    'content' => [
-                                        ['type' => 'text', 'text' => 'What is in this image?'],
-                                        ['type' => 'image_url', 'image_url' => ['url' => "data:image/jpeg;base64,{$imageContent}"]],
+
+            return Response::stream(function () use ($project, $descriptions) {
+                foreach ($project->images as $image) {
+                    if (empty($descriptions[$image])) {
+                        try {
+                            // Read and encode the image in base64
+                            $imagePath = Storage::disk('public')->path($image);
+                            $imageContent = base64_encode(file_get_contents($imagePath));
+
+                            // Make OpenAI API request
+                            $response = OpenAI::chat()->create([
+                                'model' => 'gpt-4o',
+                                'messages' => [
+                                    [
+                                        'role' => 'user',
+                                        'content' => [
+                                            ['type' => 'text', 'text' => 'What is in this image?'],
+                                            ['type' => 'image_url', 'image_url' => ['url' => "data:image/jpeg;base64,{$imageContent}"]],
+                                        ],
                                     ],
                                 ],
-                            ],
-                        ]);
-        
-                        // Extract AI-generated description
-                        $descriptions[$image] = $response['choices'][0]['message']['content'] ?? 'No description generated';
-                    } catch (\Exception $e) {
-                        $descriptions[$image] = 'Error: ' . $e->getMessage();
+                            ]);
+
+                            // Extract AI-generated description
+                            $descriptions[$image] = $response['choices'][0]['message']['content'] ?? 'No description generated';
+                        } catch (\Exception $e) {
+                            $descriptions[$image] = 'Error: ' . $e->getMessage();
+                        }
                     }
                 }
-            }
-        
-            // Update project descriptions
-            $project->update(['ai_descriptions' => $descriptions]);
-        
-            return response()->json($project);
+
+                // Stream the updated descriptions in chunks
+                echo json_encode([
+                    'status' => 'descriptions_updated',
+                    'descriptions' => $descriptions
+                ]) . "\n";
+                ob_flush();
+                flush();
+
+                // Update project descriptions
+                $project->update(['ai_descriptions' => $descriptions]);
+
+                // Final confirmation message
+                echo json_encode([
+                    'status' => 'completed',
+                    'project_id' => $project->id,
+                    'message' => 'Descriptions successfully updated.'
+                ]) . "\n";
+            }, 200, [
+                'Content-Type' => 'application/x-ndjson',
+                'X-Accel-Buffering' => 'no',
+                'Cache-Control' => 'no-cache',
+            ]);
         }
+
 
         public function generateOverallDescription($id): StreamedResponse
         {
             return Response::stream(function () use ($id) {
                 $project = Project::findOrFail($id);
                 $imageDescriptions = $project->ai_descriptions;
-
+        
                 if (!$imageDescriptions) {
                     echo json_encode(['error' => 'No image descriptions found']) . "\n";
                     ob_flush();
                     flush();
                     return;
                 }
-
+        
                 // Send initial processing status
                 echo json_encode(['status' => 'processing', 'message' => 'Starting AI processing']) . "\n";
                 ob_flush();
                 flush();
-
+        
                 // Prepare the system message for better structured output
                 $systemMessage = "You are an AI assistant that generates project descriptions. 
                     Please analyze the provided image descriptions and generate a comprehensive project description. 
                     Generate the description in 3-4 chunks, pausing after each chunk.";
-
+        
                 $prompt = "Based on these image descriptions, generate a detailed project description:\n" . 
-                         implode("\n", $imageDescriptions);
-
+                        implode("\n", $imageDescriptions);
+        
                 try {
                     $stream = OpenAI::chat()->createStreamed([
                         'model' => 'gpt-4o',
@@ -280,15 +320,15 @@ use Illuminate\Support\Facades\Response;
                         'temperature' => 0.7,
                         'max_tokens' => 1000,
                     ]);
-
+        
                     $fullDescription = '';
                     $chunkBuffer = '';
-
+        
                     foreach ($stream as $response) {
-                        $content = $response->choices[0]->delta->content;
+                        $content = $response->choices[0]->delta->content ?? '';
                         if ($content !== null) {
                             $chunkBuffer .= $content;
-                            
+        
                             // Send chunk when we have a complete sentence or significant content
                             if (str_ends_with(trim($content), '.') || strlen($chunkBuffer) > 100) {
                                 echo json_encode([
@@ -298,32 +338,32 @@ use Illuminate\Support\Facades\Response;
                                 ]) . "\n";
                                 ob_flush();
                                 flush();
-                                
+        
                                 $fullDescription .= $chunkBuffer;
                                 $chunkBuffer = '';
                             }
                         }
                     }
-
+        
                     // Send any remaining content in the buffer
                     if (!empty($chunkBuffer)) {
                         $fullDescription .= $chunkBuffer;
                     }
-
-                    // Update project with the full description
-                    $project->description = $fullDescription;
+        
+                    // Store the full description in 'overall_ai_description' column of the 'projects' table
+                    $project->overall_ai_description = $fullDescription;
                     $project->save();
-
+        
                     // Send final response
                     echo json_encode([
                         'status' => 'completed',
                         'project_id' => $project->id,
                         'overall_description' => $fullDescription,
-                        'message' => 'Description generation completed'
+                        'message' => 'Description generation completed and stored successfully'
                     ]) . "\n";
                     ob_flush();
                     flush();
-
+        
                 } catch (\Exception $e) {
                     echo json_encode([
                         'status' => 'error',
@@ -332,65 +372,75 @@ use Illuminate\Support\Facades\Response;
                     ob_flush();
                     flush();
                 }
-                
+        
             }, 200, [
                 'Content-Type' => 'application/x-ndjson',
                 'X-Accel-Buffering' => 'no',
                 'Cache-Control' => 'no-cache',
             ]);
         }
-
+        
 
         public function generateApiDocumentation(Request $request, $id): StreamedResponse
         {
-            return Response::stream(function () use ($request, $id) {
+            return Response::stream(function () use ($id) {
                 $project = Project::findOrFail($id);
-                $imageDescriptions = $request->input('image_descriptions', []);
-
+                $imageDescriptions = $project->ai_descriptions;
+        
                 if (empty($imageDescriptions)) {
-                    echo json_encode(['error' => 'No image descriptions provided']);
+                    echo json_encode(['error' => 'No image descriptions found in database']) . "\n";
+                    ob_flush();
+                    flush();
                     return;
                 }
-
+        
                 echo json_encode(['status' => 'starting']) . "\n";
                 ob_flush();
                 flush();
-
+        
                 $prompt = "Generate comprehensive API documentation for the following endpoints based on these image descriptions:\n" . 
-                implode("\n", $imageDescriptions) . 
-                "\n\nInclude for each endpoint:\n" .
-                "- Endpoint URL\n" .
-                "- HTTP Method\n" .
-                "- Request Parameters with examples\n" .
-                "- Response Format (success and error cases)\n" .
-                "- Possible Status Codes\n" .
-                "- Example Curl request\n";
-
+                    implode("\n", $imageDescriptions) . 
+                    "\n\nInclude for each endpoint:\n" .
+                    "- Endpoint URL\n" .
+                    "- HTTP Method\n" .
+                    "- Request Parameters with examples\n" .
+                    "- Response Format (success and error cases)\n" .
+                    "- Possible Status Codes\n" .
+                    "- Example Curl request\n";
+        
                 echo json_encode(['status' => 'generating']) . "\n";
                 ob_flush();
                 flush();
-
+        
                 $response = OpenAI::chat()->create([
                     'model' => 'gpt-4o',
                     'messages' => [['role' => 'user', 'content' => $prompt]],
                 ]);
-
+        
                 $markdown = $response['choices'][0]['message']['content'];
-                \Storage::put("api_docs/project_{$project->id}.md", $markdown);
-
+                Storage::put("api_docs/project_{$project->id}.md", $markdown);
+        
+                // Store documentation in JSON format
+                $project->api_documentation = json_encode([
+                    'documentation' => $markdown,
+                    'path' => "api_docs/project_{$project->id}.md",
+                ]);
+                $project->save();
+        
                 echo json_encode([
                     'status' => 'completed',
                     'project_id' => $project->id,
+                    'documentation_path' => "api_docs/project_{$project->id}.md",
                     'documentation' => $markdown,
-                ]);
-                
+                ]) . "\n";
+                ob_flush();
+                flush();
             }, 200, [
                 'Content-Type' => 'application/x-ndjson',
                 'X-Accel-Buffering' => 'no',
                 'Cache-Control' => 'no-cache',
             ]);
         }
-
         
         public function previewApiDocumentation($id)
         {
@@ -410,65 +460,73 @@ use Illuminate\Support\Facades\Response;
         
         public function updateProjectImages(Request $request, Project $project): JsonResponse
         {
-            $this->authorize('update', $project);
-
+            // Validate the request data
             $request->validate([
                 'images' => 'required|array',
-                'images.*.id' => 'required|exists:images,id',
+                'images.*.file_path' => 'required|string',
                 'images.*.description' => 'nullable|string',
-                'images.*.order' => 'required|integer|min:0',
+                'images.*.order' => 'required|integer|min:1',
             ]);
 
             try {
                 \DB::beginTransaction();
 
-                // Update each image
+                // 1. Delete all existing images for this project
+                Image::where('project_id', $project->id)->delete();
+
+                // 2. Insert new images
+                $newImages = [];
                 foreach ($request->images as $imageData) {
-                    $image = Image::findOrFail($imageData['id']);
-                    
-                    // Verify the image belongs to this project
-                    if ($image->project_id !== $project->id) {
-                        throw new \Exception('Invalid image ID for this project');
-                    }
-
-                    $image->update([
-                        'description' => $imageData['description'],
-                        'order' => $imageData['order']
-                    ]);
+                    $newImages[] = [
+                        'project_id' => $project->id,
+                        'file_path' => $imageData['file_path'],
+                        'description' => $imageData['description'] ?? null,
+                        'order' => $imageData['order'],
+                        'created_at' => now(),
+                        'updated_at' => now(),
+                    ];
                 }
 
-                // Get all project images ordered by the new order
-                $orderedImages = $project->images()
-                    ->orderBy('order')
-                    ->get();
-
-                // Reindex orders to ensure they are sequential
-                foreach ($orderedImages->values() as $index => $image) {
-                    $image->update(['order' => $index + 1]);
-                }
-
-                // Combine descriptions into project description
-                $combinedDescription = $orderedImages
-                    ->map(fn($image) => $image->description)
-                    ->filter()
-                    ->join("\n\n");
-
-                $project->update(['description' => $combinedDescription]);
+                Image::insert($newImages);
 
                 \DB::commit();
 
+                // Return JSON response
                 return response()->json([
                     'message' => 'Images updated successfully',
-                    'project' => $project->load('images')
-                ]);
-
+                    'project_id' => $project->id,
+                    'images' => $newImages,
+                ], 200);
             } catch (\Exception $e) {
                 \DB::rollBack();
+
                 return response()->json([
                     'message' => 'Failed to update images',
-                    'error' => $e->getMessage()
+                    'error' => $e->getMessage(),
                 ], 500);
             }
         }
+
+        public function getProjectImages(Project $project): JsonResponse
+        {
+            try {
+                // Retrieve all images for the project ordered by 'order'
+                $images = Image::where('project_id', $project->id)
+                    ->orderBy('order')
+                    ->get(['project_id', 'file_path', 'description', 'order']);
+
+                // Return JSON response
+                return response()->json([
+                    'project_id' => $project->id,
+                    'images' => $images,
+                ], 200);
+            } catch (\Exception $e) {
+                return response()->json([
+                    'message' => 'Failed to retrieve images',
+                    'error' => $e->getMessage(),
+                ], 500);
+            }
+        }
+        
         
     }

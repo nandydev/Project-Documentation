@@ -44,6 +44,12 @@ Route::middleware('auth:sanctum')->group(function () {
     // API Documentation Endpoints
     Route::post('/projects/{id}/documentation/generate', [ProjectController::class, 'generateApiDocumentation']);
     Route::get('/projects/{id}/documentation/preview', [ProjectController::class, 'previewApiDocumentation']);
-    
+    Route::post('/projects/{project}/images', [ProjectController::class, 'updateProjectImages']);
+
+    Route::get('/projects/{project}/images', [ProjectController::class, 'getProjectImages']);
+    Route::get('/projects/{id}/getproject', [ProjectController::class, 'getproject']);
+
+
+
 });
 
